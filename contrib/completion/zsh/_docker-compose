@@ -19,6 +19,11 @@
 #  * @felixr docker zsh completion script : https://github.com/felixr/docker-zsh-completion
 # -------------------------------------------------------------------------
 
+__docker-compose_q() {
+    output=(${(f)"$(_call_program commands docker-compose $compose_options $@)"})
+    echo $output
+}
+
 # For compatibility reasons, Compose and therefore its completion supports several
 # stack compositon files as listed here, in descending priority.
 # Support for these filenames might be dropped in some future version.
@@ -38,7 +43,7 @@ ___docker-compose_all_services_in_compose_file() {
     local already_selected
     local -a services
     already_selected=$(echo $words | tr " " "|")
-    awk -F: '/^[a-zA-Z0-9]/{print $1}' "${compose_file:-$(__docker-compose_compose_file)}" 2>/dev/null | grep -Ev "$already_selected"
+    __docker-compose_q config --services | grep -Ev "$already_selected"
 }
 
 # All services, even those without an existing container
@@ -56,8 +61,13 @@ ___docker-compose_services_with_key() {
     local already_selected
     local -a buildable
     already_selected=$(echo $words | tr " " "|")
-    # flatten sections to one line, then filter lines containing the key and return section name.
-    awk '/^[a-zA-Z0-9]/{printf "\n"};{printf $0;next;}' "${compose_file:-$(__docker-compose_compose_file)}" 2>/dev/null | awk -F: -v key=": +$1:" '$0 ~ key {print $1}' 2>/dev/null | grep -Ev "$already_selected"
+    # flatten sections under "services" to one line, then filter lines containing the key and return section name
+    __docker-compose_q config \
+            | sed -n -e '/^services:/,/^[^ ]/p' \
+            | sed -n 's/^  //p' \
+            | awk '/^[a-zA-Z0-9]/{printf "\n"};{printf $0;next;}' \
+            | awk -F: -v key=": +$1:" '$0 ~ key {print $1}' \
+            | grep -Ev "$already_selected"
 }
 
 # All services that are defined by a Dockerfile reference
@@ -83,8 +93,8 @@ __docker-compose_services_from_image() {
 __docker-compose_get_services() {
     [[ $PREFIX = -* ]] && return 1
     integer ret=1
-    local kind
-    declare -a running paused stopped lines args services
+    local kind service
+    declare -a running paused stopped services_ids args cmd_args
 
     docker_status=$(docker ps > /dev/null 2>&1)
     if [ $? -ne 0 ]; then
@@ -94,48 +104,36 @@ __docker-compose_get_services() {
 
     kind=$1
     shift
-    [[ $kind =~ (stopped|all) ]] && args=($args -a)
 
-    lines=(${(f)"$(_call_program commands docker ps $args)"})
-    services=(${(f)"$(_call_program commands docker-compose 2>/dev/null $compose_options ps -q)"})
+    args=(-a "--format '{{.Names}}:        {{.RunningFor}}, {{.ID}}, {{.Image}}'")
+    [[ $kind = (stopped|all) ]] && args=(
+        $args
+        "--filter 'status=created'"
+        "--filter 'status=restarting'"
+        "--filter 'status=exited'"
+        "--filter 'status=dead'"
+    )
+    [[ $kind = (paused|all) ]] && args=(
+        $args
+        "--filter 'status=paused'"
+    )
+    [[ $kind = (running|all) ]] && args=(
+        $args
+        "--filter 'status=running'"
+    )
 
-    # Parse header line to find columns
-    local i=1 j=1 k header=${lines[1]}
-    declare -A begin end
-    while (( j < ${#header} - 1 )); do
-        i=$(( j + ${${header[$j,-1]}[(i)[^ ]]} - 1 ))
-        j=$(( i + ${${header[$i,-1]}[(i)  ]} - 1 ))
-        k=$(( j + ${${header[$j,-1]}[(i)[^ ]]} - 2 ))
-        begin[${header[$i,$((j-1))]}]=$i
-        end[${header[$i,$((j-1))]}]=$k
-    done
-    lines=(${lines[2,-1]})
-
-    # Container ID
-    local line s name
-    local -a names
-    for line in $lines; do
-        if [[ ${services[@]} == *"${line[${begin[CONTAINER ID]},${end[CONTAINER ID]}]%% ##}"* ]]; then
-            names=(${(ps:,:)${${line[${begin[NAMES]},-1]}%% *}})
-            for name in $names; do
-                s="${${name%_*}#*_}:${(l:15:: :::)${${line[${begin[CREATED]},${end[CREATED]}]/ ago/}%% ##}}"
-                s="$s, ${line[${begin[CONTAINER ID]},${end[CONTAINER ID]}]%% ##}"
-                s="$s, ${${${line[${begin[IMAGE]},${end[IMAGE]}]}/:/\\:}%% ##}"
-                if [[ ${line[${begin[STATUS]},${end[STATUS]}]} = Exit* ]]; then
-                    stopped=($stopped $s)
-                else
-                    if [[  ${line[${begin[STATUS]},${end[STATUS]}]} = *\(Paused\)* ]]; then
-                        paused=($paused $s)
-                    fi
-                    running=($running $s)
-                fi
-            done
-        fi
+    services_ids=($(__docker-compose_q ps -q))
+    for service_id in $services_ids; do
+        cmd_args=($args "--filter 'ID=$service_id'")
+        service=${(f)"$(_call_program commands docker ps $cmd_args)"}
+        [[ $kind = running ]] && running=($running $service)
+        [[ $kind = paused ]] && paused=($paused $service)
+        [[ $kind = stopped ]] && stopped=($stopped $service)
     done
 
-    [[ $kind =~ (running|all) ]] && _describe -t services-running "running services" running "$@" && ret=0
-    [[ $kind =~ (paused|all) ]] && _describe -t services-paused "paused services" paused "$@" && ret=0
-    [[ $kind =~ (stopped|all) ]] && _describe -t services-stopped "stopped services" stopped "$@" && ret=0
+    [[ $kind = (running|all) ]] && _describe -t services-running "running services" running "$@" && ret=0
+    [[ $kind = (paused|all) ]] && _describe -t services-paused "paused services" paused "$@" && ret=0
+    [[ $kind = (stopped|all) ]] && _describe -t services-stopped "stopped services" stopped "$@" && ret=0
 
     return ret
 }
@@ -153,11 +151,6 @@ __docker-compose_stoppedservices() {
 __docker-compose_runningservices() {
     [[ $PREFIX = -* ]] && return 1
     __docker-compose_get_services running "$@"
-}
-
-__docker-compose_services() {
-    [[ $PREFIX = -* ]] && return 1
-    __docker-compose_get_services all "$@"
 }
 
 __docker-compose_caching_policy() {
@@ -283,7 +276,7 @@ __docker-compose_subcommand() {
                 "--service-ports[Run command with the service's ports enabled and mapped to the host.]" \
                 '(-p --publish)'{-p,--publish=-}"[Run command with manually mapped container's port(s) to the host.]" \
                 '-T[Disable pseudo-tty allocation. By default `docker-compose run` allocates a TTY.]' \
-                '(-):services:__docker-compose_services' \
+                '(-):services:__docker-compose_services_all' \
                 '(-):command: _command_names -e' \
                 '*::arguments: _normal' && ret=0
             ;;
@@ -351,14 +344,14 @@ _docker-compose() {
         '(- :)'{-h,--help}'[Get help]' \
         '--verbose[Show more output]' \
         '(- :)'{-v,--version}'[Print version and exit]' \
-        '(-f --file)'{-f,--file}'[Specify an alternate docker-compose file (default: docker-compose.yml)]:file:_files -g "*.yml"' \
-        '(-p --project-name)'{-p,--project-name}'[Specify an alternate project name (default: directory name)]:project name:' \
+        '(-f --file)'{-f=,--file=}'[Specify an alternate docker-compose file (default: docker-compose.yml)]:file:_files -g "*.yml"' \
+        '(-p --project-name)'{-p=,--project-name=}'[Specify an alternate project name (default: directory name)]:project name:' \
         '(-): :->command' \
         '(-)*:: :->option-or-argument' && ret=0
 
     local compose_file=${opt_args[-f]}${opt_args[--file]}
     local compose_project=${opt_args[-p]}${opt_args[--project-name]}
-    local compose_options="${compose_file:+--file $compose_file} ${compose_project:+--project-name $compose_project}"
+    local compose_options=${compose_file:+-f $compose_file} ${compose_project:+-p $compose_project}
 
     case $state in
         (command)
